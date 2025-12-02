@@ -742,6 +742,7 @@ def daily_worker():
             now = datetime.now()
             day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
             
+            # Save daily snapshot
             with product_stats_lock:
                 daily_snapshot = {}
                 for pid, ps in product_stats.items():
@@ -753,20 +754,27 @@ def daily_worker():
                         "dwell_count": len(dwell_times),
                         "avg_dwell": avg_dwell
                     }
-                
-                daily_col.insert_one({
-                    "timestamp": day_start,
-                    "products": daily_snapshot
-                })
-                
-                # Reset stats
+            
+            daily_col.insert_one({
+                "timestamp": day_start,
+                "products": daily_snapshot
+            })
+            
+            # Reset in-memory stats for new day
+            with product_stats_lock:
                 product_stats.clear()
-                
-                # Clear zone dot history for new day
-                with zone_dot_history_lock:
-                    zone_dot_history.clear()
-                
-                print(f"[DAILY] Saved daily snapshot for {day_start} and reset stats")
+            
+            # Clear zone dot history for new day
+            with zone_dot_history_lock:
+                zone_dot_history.clear()
+            
+            # Reset global person registry so IDs "refill" each day
+            global next_global_id
+            with registry_lock:
+                registry.clear()
+                next_global_id = 0
+            
+            print(f"[DAILY] Saved daily snapshot for {day_start} and reset stats & registry")
         except Exception as e:
             print(f"[ERROR] Daily worker failed: {e}")
 
