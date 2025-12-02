@@ -741,39 +741,62 @@ def daily_worker():
         try:
             now = datetime.now()
             day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            
-            # Save daily snapshot
+
+            # Full in-memory snapshot of product_stats so we can safely restore on DB failure
+            snapshot_stats = {}
+
+            # Atomically snapshot and clear product_stats so no visits are lost
             with product_stats_lock:
-                daily_snapshot = {}
                 for pid, ps in product_stats.items():
-                    dwell_times = ps["dwell_sessions"]
-                    avg_dwell = sum(dwell_times) / len(dwell_times) if dwell_times else 0
-                    
-                    daily_snapshot[pid] = {
+                    # Deep(ish) copy to detach from live structures
+                    snapshot_stats[pid] = {
                         "footfall": ps["footfall"],
-                        "dwell_count": len(dwell_times),
-                        "avg_dwell": avg_dwell
+                        "dwell_sessions": list(ps["dwell_sessions"]),
+                        "current_sessions": dict(ps["current_sessions"]),
                     }
-            
-            daily_col.insert_one({
-                "timestamp": day_start,
-                "products": daily_snapshot
-            })
-            
-            # Reset in-memory stats for new day
-            with product_stats_lock:
+
+                # Clear stats while still holding the lock; new visits go to the new day
                 product_stats.clear()
-            
+
+            # Build the compact document that we actually store in MongoDB
+            daily_products_doc = {}
+            for pid, ps in snapshot_stats.items():
+                dwell_times = ps["dwell_sessions"]
+                avg_dwell = sum(dwell_times) / len(dwell_times) if dwell_times else 0
+
+                daily_products_doc[pid] = {
+                    "footfall": ps["footfall"],
+                    "dwell_count": len(dwell_times),
+                    "avg_dwell": avg_dwell,
+                }
+
+            try:
+                # Safe to write to DB outside the lock using the derived snapshot copy
+                daily_col.insert_one({
+                    "timestamp": day_start,
+                    "products": daily_products_doc
+                })
+            except Exception as db_err:
+                # Restore in-memory stats if DB write fails so data is not lost.
+                # We prefer consistency over preserving the tiny window of stats
+                # that may have arrived between the clear() and the DB failure.
+                with product_stats_lock:
+                    product_stats.clear()
+                    product_stats.update(snapshot_stats)
+
+                # Log DB error but continue with daily cleanup so heatmaps/registry reset
+                print(f"[ERROR] Daily snapshot DB write failed: {db_err}")
+
             # Clear zone dot history for new day
             with zone_dot_history_lock:
                 zone_dot_history.clear()
-            
+
             # Reset global person registry so IDs "refill" each day
             global next_global_id
             with registry_lock:
                 registry.clear()
                 next_global_id = 0
-            
+
             print(f"[DAILY] Saved daily snapshot for {day_start} and reset stats & registry")
         except Exception as e:
             print(f"[ERROR] Daily worker failed: {e}")
